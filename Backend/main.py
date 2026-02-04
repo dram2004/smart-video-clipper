@@ -2,6 +2,8 @@
 import os
 import io
 import asyncio
+import uuid 
+import json
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,9 +20,13 @@ load_dotenv()
 cf_acc_id = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 # get cloudflare API token
 cf_api_token = os.getenv("CLOUDFLARE_API_TOKEN")
+# get cloudflare d1 DB ID
+cf_d1_ID = os.getenv("CLOUDFLARE_D1_ID")
+#  get cloudflare Vector index
+cf_vector_index = os.getenv("CLOUDFLARE_VECTOR_INDEX")
 
 # --- Verify the Environment Variables Exist
-if not cf_acc_id or not cf_api_token:
+if not all([cf_acc_id,cf_api_token,cf_d1_ID,cf_vector_index]):
     # if either of the keys do not exist, raise a runtime error
     raise RuntimeError("Missing Cloudflare credentials in .env file...")
 
@@ -38,8 +44,12 @@ app.add_middleware(
 
 # --- Setup Cloudflare Configuration ---
 
-# base url first to use when setting up httpx asynchronous client
-base_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_acc_id}/ai/run"
+# AI base url first to use when setting up httpx asynchronous client
+AI_base_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_acc_id}/ai/run"
+# vector base URL
+VECTOR_base_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_acc_id}/vectorize/v2/indexes/{cf_vector_index}/insert"
+# D1 database base url
+D1_BASE = f"https://api.cloudflare.com/client/v4/accounts/{cf_acc_id}/d1/database/{cf_d1_ID}/query"
 # headers containing API token for asynchronous client setup
 HEADERS = {"Authorization": f"Bearer {cf_api_token}"}
 
@@ -65,7 +75,7 @@ async def call_whisper(audio_bytes: bytes): # function takes bytes of audio as i
     whisper_header["Content-Type"] = "application/octet-stream"
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{base_url}/{model}",
+            f"{AI_base_url}/{model}",
             headers=whisper_header,
             content=audio_bytes,
             timeout=60.0 # times out after 60 seconds, needed to increase for audio processing
@@ -107,13 +117,14 @@ async def call_llm(transcript: str): # function takes in string transcript
     payload = {
         "messages": [
             {"role": "system", "content": "You are a valuable study assistant"},
-            {"role": "user", "content": prompt[:6000]}
-        ]
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 2048
     }
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{base_url}/{model}",
+            f"{AI_base_url}/{model}",
             headers=HEADERS,
             json=payload,
             timeout=60.0
@@ -127,6 +138,103 @@ async def call_llm(transcript: str): # function takes in string transcript
         # get response json
         result = response.json()
         return result.get("result", {}).get("response", "No Summary Generated...")
+
+# Helper 3: need function to convert list of text strings into vectors for RAG
+async def generate_embeddings(text_chunks):
+    """
+    converts list of text strings into vectors
+    """
+    model = "@cf/baai/bge-base-en-v1.5"
+
+    # use AsyncClient to send text_chunks to model to generate text embeddings
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{AI_base_url}/{model}",
+            headers=HEADERS,
+            json={"text": text_chunks}
+        )
+    return response.json().get("result", {}).get("data", [])
+
+# Helper 4: need helper for generating embeddings for each chunk then saving it to vectorize with proper metadata
+async def save_vectors(filename, text_chunks):
+    """
+    1. Generate embeddings for each chunk.
+    2. Save to Vectorize with metadata (timestamp).
+    """
+    # make sure we have a index name before continuing
+    if not cf_vector_index:
+        print("skipping vector save because no index has been configured")
+        return
+    print("generating embeddings...")
+
+    # call CF bge model to generate embeddings
+    embeddings_data = await generate_embeddings(text_chunks) # each chunks embedding is list of 768 numbers representing meaning
+
+    # need list of vector JSONs
+    vectors = []
+
+    # define the length each chunk represents
+    chunk_duration_seconds = 300 # 5-minute chunks
+
+    for i, embedding_obj in enumerate(embeddings_data):
+        # calculate vectors start time for metadata
+        start_time = i * chunk_duration_seconds 
+        # make vector id
+        vector_id = f"{filename}_chunk_{i}_{uuid.uuid4().hex[:6]}"
+        # append vector to vectors in JSON form
+        vectors.append({
+            "id": vector_id,
+            "values": embedding_obj, # list of 768 numbers
+            # add metatdata (filename, text preview, chunk index, and start time)
+            "metadata": {
+                "filename": filename,
+                "text_preview": text_chunks[i][:100], # preview is first 100 characters of text chunk,
+                "chunk_index": i,
+                "start_time_sec": start_time
+            }
+        })
+
+    # by now we have a list of vector JSONs representing each processed chunk
+    # now insert all into Vectorize using NDJSON format 
+    ndjson_payload = "\n".join([json.dumps(v) for v in vectors])
+
+    # send ndjson_payload to Vectorize in CF
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            VECTOR_base_url,
+            headers={"Authorization": f"Bearer {cf_api_token}", "Content-Type": "application/x-ndjson"}, # specify input format
+            content=ndjson_payload,
+            timeout=60.0
+        )
+
+        # make sure we successfully sent to Vectorize:
+        if response.status_code == 200:
+            print(f"Indexed {len(vectors)} vectors in Cloudflare!")
+        else:
+            print(f"Vector Error: {response.text}")
+
+# Helper 5: need helper for saving filename, transcript, and summary in database
+async def save_2_db(filename, transcript, summary):
+    """
+    save metadata to SQL D1
+    necessary for remembering all lectures passed into smart clipper
+    """
+    sql_command = "INSERT INTO lectures (filename, transcript, summary) VALUES (?, ?, ?)"
+
+    # define payload with sql command and provided arguments
+    payload = {"sql": sql_command, "params": [filename, transcript, summary]}
+
+    # send to D1 using asyncclient
+    async with httpx.AsyncClient() as client:
+        response = await client.post(D1_BASE, headers=HEADERS, json=payload)
+        
+        data = response.json()
+        
+        if response.status_code == 200 and data.get("success"):
+            print("Succesfully saved record to D1 SQL")
+        else:
+            print(f"❌ DATABASE ERROR: {response.status_code}")
+            print(data)
 
 # --- ENDPOINTS ---
 @app.get("/") # for base path
@@ -148,7 +256,7 @@ async def test_ai_connection():
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                f"{base_url}/{model}", 
+                f"{AI_base_url}/{model}", 
                 headers=HEADERS,
                 json=payload,
                 timeout=10.0
@@ -166,6 +274,8 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     Send text transcipt to LLM --> Llama-3 returns summary of lecture
     """
+    print(f"Processing {file.filename}...")
+
     # read the uploaded file into memory
     audio_data = await file.read()
 
@@ -201,7 +311,13 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
     # if transcript returned, pass to the LLM using helper function #2 to get in depth summary
     if full_transcript:
-        notes = await call_llm(full_transcript)
+        print("Sending transcript to Llama-3...")
+        notes = await call_llm(full_transcript) # calling llama
+
+        # (background) send to SQL database and Vectorize:
+        asyncio.create_task(save_2_db(file.filename, full_transcript, notes)) # send filename, transcript, and notes to DB
+        asyncio.create_task(save_vectors(file.filename, chunk_transcripts)) # send filename and chunked transcript to Vectorize
+
     else: # if transcript not generated (silent or inaudible mp3), return that no speech was detected
         notes = "No Speech Detected in any of the audio chunks"
     
@@ -209,7 +325,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
     return {
         "filename": file.filename,
         "chunks_processed": len(audio_chunks),
-        "transcript": full_transcript,
-        "notes": notes
+        "notes": notes,
+        "status": "Video processing complete, saving to DB and Vectorize in Background"
     }
 

@@ -1,9 +1,15 @@
 #Backend/main.py
 import os
+import io
+import asyncio
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+# importss needed for chunking audio into segments
+from pydub import AudioSegment
+import static_ffmpeg
+static_ffmpeg.add_paths() # tells pydub where to find ffmpeg binary
 
 # --- Load Required Environment Variables ---
 
@@ -94,9 +100,8 @@ async def call_llm(transcript: str): # function takes in string transcript
     3. **Key Points**: short and concise bullet points describing all concepts gone over during class. An example would be 'Theorem 7: Fermats Little Theorem', or 'Defining the order of a in terms of modulo 6', or 'Seven Days War'
 
     TRANSCRIPT:
-    {transcript}
+    {transcript[:12000]}
     """
-
     # prepare payload: truncate transcript to ~6000 characters bc context limits of free plan
     # in future, can use "map_reduce" strategy for long transcripts
     payload = {
@@ -164,19 +169,47 @@ async def transcribe_audio(file: UploadFile = File(...)):
     # read the uploaded file into memory
     audio_data = await file.read()
 
-    # send the audio data to CF using helper function #1 
-    transcript = await call_whisper(audio_data)
+    # in order to process long mp3's with whisper, need to chunk video into shorter segments
+    audio = AudioSegment.from_file(io.BytesIO(audio_data)) # creates audio segment object from audio bytes
+
+    # define chunk size (5 minutes in ms)
+    CHUNK_LENGTH = 5*60*1000 # (10 minutes * 60 seconds * 1000 ms)
+
+    # create chunks
+    audio_chunks = []
+    for i in range(0, len(audio), CHUNK_LENGTH):
+        # get the 10 minute chunk:
+        chunk = audio[i : i + CHUNK_LENGTH]
+        # add 10 minute chunk to array of audio chunks
+        audio_chunks.append(chunk)
+
+    print(f"successfully split audio into {len(audio_chunks)} 5 minute segments")
+
+    # need to transcribe each chunk using whisper:
+    transcription_tasks = []
+    for i, chunk in enumerate(audio_chunks):
+        # convert pydub chunks back into raw bytes to send to CF
+        buffer = io.BytesIO()
+        chunk.export(buffer, format="mp3", bitrate="64k") # downsample audio to 64kbps to make file size smaller and avoid whisper breaking
+        transcription_tasks.append(call_whisper(buffer.getvalue()))
+    
+    # we now have a list of audio chunks ready to send to the Whisper model (send all chunks asynchronously) using helper function #1
+    chunk_transcripts = await asyncio.gather(*transcription_tasks)
+
+    # join all the transcripts from chunks together
+    full_transcript = " ".join(chunk_transcripts)
 
     # if transcript returned, pass to the LLM using helper function #2 to get in depth summary
-    if transcript:
-        notes = await call_llm(transcript)
+    if full_transcript:
+        notes = await call_llm(full_transcript)
     else: # if transcript not generated (silent or inaudible mp3), return that no speech was detected
-        notes = "No Speech Detected"
+        notes = "No Speech Detected in any of the audio chunks"
     
     # return json of filename(inputted), transcript(Whisper output), and notes(Llama-3 output)
     return {
         "filename": file.filename,
-        "transcript": transcript,
+        "chunks_processed": len(audio_chunks),
+        "transcript": full_transcript,
         "notes": notes
     }
 

@@ -3,7 +3,7 @@
 import React, { useState } from "react";
 import axios from "axios";
 import { useDropzone } from "react-dropzone";
-import { Upload, FileAudio, CheckCircle, Loader2 } from "lucide-react";
+import { Upload, FileAudio, CheckCircle, Loader2, FileDown } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -62,6 +62,32 @@ export default function LectureUploader() {
       setError("Failed to upload lecture. Is the backend running?");
     } finally {
       setUploading(false);
+    }
+  };
+
+  const handleDownload = async () => {
+    if (!result) return;
+  
+    try {
+      const response = await axios.post(
+        "http://127.0.0.1:8000/generate-pdf",
+        {
+          filename: result.filename,
+          notes: result.notes,
+        },
+        { responseType: "blob" } // Important for files
+      );
+  
+      // Create a link to download the blob
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", `${result.filename}_notes.pdf`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (err) {
+      console.error("Download failed", err);
     }
   };
 
@@ -141,6 +167,13 @@ export default function LectureUploader() {
                   {result.notes}
                 </ScrollArea>
               </div>
+
+              <Button 
+                onClick={handleDownload} 
+                className="w-full bg-[#500000] hover:bg-[#300000] text-white flex gap-2 items-center justify-center"
+              >
+                <FileDown className="w-4 h-4" /> Download Professional PDF
+              </Button>
 
               <div className="text-xs text-gray-400 text-center">
                 Filename: {result.filename} | Status: {result.status}

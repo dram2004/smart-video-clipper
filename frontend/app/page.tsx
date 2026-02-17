@@ -1,36 +1,43 @@
-// frontend/app/page.tsx
 import LectureUploader from "@/components/LectureUploader";
 import LectureList from "@/components/LectureList";
-import LectureSearch from "@/components/LectureSearch"; // <--- IMPORT THIS
+import LectureSearch from "@/components/LectureSearch";
+import HomeworkUploader from "@/components/HomeworkUploader"; // <--- Import it
 
 export default function Home() {
   return (
-    <main className="min-h-screen bg-slate-50">
-      {/* Header */}
-      <div className="bg-[#500000] text-white py-6 shadow-md">
-        <div className="container mx-auto px-4">
-          <h1 className="text-3xl font-bold tracking-tight">
-            Texas A&M Note Taker
+    <main className="min-h-screen bg-slate-50 p-8 font-sans text-slate-900">
+      <div className="max-w-7xl mx-auto space-y-8">
+        
+        {/* Header */}
+        <div className="text-center space-y-2 mb-10">
+          <h1 className="text-5xl font-extrabold text-[#500000] tracking-tight">
+            Smart Video Clipper
           </h1>
-          <p className="text-gray-300 text-sm mt-1">
-            Department of Computer Engineering 
+          <p className="text-slate-500 text-lg">
+            AI-Powered Lecture Assistant & Exam Prep
           </p>
         </div>
-      </div>
 
-      <div className="container mx-auto py-8 px-4">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+        {/* Main Grid Layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           
-          {/* LEFT COLUMN: Search & History (Takes 4 cols) */}
-          <div className="lg:col-span-4 space-y-6">
-             <LectureSearch /> {/* <--- ADD SEARCH BAR HERE */}
-             <LectureList />
+          {/* Column 1: Manage Lectures */}
+          <div className="space-y-6">
+            <LectureUploader />
+            <LectureList />
           </div>
 
-          {/* RIGHT COLUMN: Uploader (Takes 8 cols) */}
-          <div className="lg:col-span-8 space-y-6">
-            <LectureUploader />
+          {/* Column 2: Search & Study */}
+          <div className="space-y-6">
+            <LectureSearch />
+            {/* Future: ChatBot or Summary Card */}
           </div>
+
+          {/* Column 3: Active Learning (NEW) */}
+          <div className="space-y-6">
+            <HomeworkUploader />
+          </div>
+
         </div>
       </div>
     </main>

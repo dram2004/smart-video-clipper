@@ -1,6 +1,7 @@
 // frontend/app/layout.tsx
 import type { Metadata } from "next";
 import { Inter } from "next/font/google"; // <--- Import Inter
+import "katex/dist/katex.min.css";
 import "./globals.css";
 
 // Configure the font

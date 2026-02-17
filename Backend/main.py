@@ -1,6 +1,7 @@
 #Backend/main.py
 import os
 import io
+import re 
 import asyncio
 import uuid 
 import json
@@ -17,6 +18,13 @@ static_ffmpeg.add_paths() # tells pydub where to find ffmpeg binary
 # imports for PDF output logic
 from fpdf import FPDF
 from fastapi.responses import Response
+
+# imports for pdf processing
+import fitz
+
+# imports for pratice content gen
+from pydantic import BaseModel
+from typing import List, Optional
 
 # --- Load Required Environment Variables ---
 
@@ -57,6 +65,15 @@ VECTOR_base_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_acc_id}/ve
 D1_BASE = f"https://api.cloudflare.com/client/v4/accounts/{cf_acc_id}/d1/database/{cf_d1_ID}/query"
 # headers containing API token for asynchronous client setup
 HEADERS = {"Authorization": f"Bearer {cf_api_token}"}
+
+# --- DATA MODELS ---
+class ExamRequest(BaseModel):
+    homework_id: int
+
+class ExamProblem(BaseModel):
+    question: str
+    solution: str
+    explanation: str
 
 # --- HELPERS ---
 # Helper 1: Transcribing audio using openai/whisper model
@@ -199,7 +216,6 @@ async def call_llm(text_chunks: list): # function takes in string transcript
             return f"Error: {str(e)}"
 
 # Helper 3: need function to convert list of text strings into vectors for RAG
-# Helper 3: Generating Embeddings (With Debugging)
 async def generate_embeddings(text_chunks):
     """
     Converts list of text strings into vectors.
@@ -236,7 +252,6 @@ async def generate_embeddings(text_chunks):
             return []
 
 # Helper 4: need helper for generating embeddings for each chunk then saving it to vectorize with proper metadata
-# Helper 4: Save vectors with Sanitized NDJSON
 async def save_vectors(filename, text_chunks):
     if not cf_vector_index: return
     print("generating embeddings...")
@@ -280,6 +295,7 @@ async def save_vectors(filename, text_chunks):
             print(f"✅ Indexed {len(vectors)} vectors in Cloudflare!")
         else:
             print(f"❌ Vector Error: {response.text}")
+
 # Helper 5: need helper for saving filename, transcript, and summary in database
 async def save_2_db(filename, transcript, summary):
     """
@@ -303,24 +319,166 @@ async def save_2_db(filename, transcript, summary):
             print(f"❌ DATABASE ERROR: {response.status_code}")
             print(data)
 
-# Helper 6: clean upp text to be well-structured foor pdf creation
+# Helper 6: Convert LaTeX to HTML for FPDF2 (Safe Latin-1 Version)
 def clean_for_pdf(text: str) -> str:
     """
-    Replaces smart quotes, bullets, and other non-Latin-1 characters
-    that crash the FPDF 'Times' font.
+    Converts LaTeX math into simple HTML.
+    CRITICAL CHANGE: Maps Greek/Symbols to plain text names to avoid 
+    Unicode errors with standard PDF fonts.
     """
-    replacements = {
-        "\u2018": "'", "\u2019": "'", # Single smart quotes
-        "\u201c": '"', "\u201d": '"', # Double smart quotes
-        "\u2022": "-",                # Bullet points
-        "\u2013": "-", "\u2014": "-", # En-dashes and Em-dashes
-        "\u2026": "...",              # Ellipsis
-    }
-    for char, replacement in replacements.items():
-        text = text.replace(char, replacement)
+    if not text: return ""
     
-    # Finally, force convert to Latin-1, replacing any other unknowns with '?'
-    return text.encode('latin-1', 'replace').decode('latin-1')
+    # 1. HTML Entity Map (Mapped to Latin-1 safe text)
+    symbol_map = {
+        # Greek Letters -> Text names
+        r"\\phi": "phi",
+        r"\\Phi": "Phi",
+        r"\\theta": "theta",
+        r"\\Theta": "Theta",
+        r"\\alpha": "alpha",
+        r"\\beta": "beta",
+        r"\\gamma": "gamma",
+        r"\\lambda": "lambda",
+        r"\\pi": "pi",
+        r"\\sigma": "sigma",
+        r"\\infty": "infinity",
+        
+        # Operators -> Standard chars
+        r"\\le": "<=",
+        r"\\ge": ">=",
+        r"\\neq": "!=",
+        r"\\equiv": "=",
+        r"\\approx": "~=",
+        r"\\times": "x",
+        r"\\cdot": "*",
+        
+        # Sets -> Bold Text
+        r"\\mathbb\{Z\}": "<b>Z</b>",
+        r"\\mathbb\{R\}": "<b>R</b>",
+        r"\\mathbb\{N\}": "<b>N</b>",
+        r"\\mathbb\{F\}": "<b>F</b>",
+        r"\\mathbb\{Q\}": "<b>Q</b>",
+        
+        # Misc
+        r"\\pmod\{(.+?)\}" : r" (mod \1)",
+    }
+
+    clean = text
+    for latex, html in symbol_map.items():
+        clean = re.sub(latex, html, clean)
+
+    # 2. Regex for Superscripts (x^2 or x^{12}) -> x<sup>2</sup>
+    # This works fine because numbers are Latin-1 safe!
+    clean = re.sub(r"\^\{([^{}]+)\}", r"<sup>\1</sup>", clean) 
+    clean = re.sub(r"\^([0-9a-zA-Z])", r"<sup>\1</sup>", clean) 
+
+    # 3. Regex for Subscripts (x_i) -> x<sub>i</sub>
+    clean = re.sub(r"_\{([^{}]+)\}", r"<sub>\1</sub>", clean)
+    clean = re.sub(r"_([0-9a-zA-Z])", r"<sub>\1</sub>", clean)
+
+    # 4. Fractions: \frac{a}{b} -> (a)/(b)
+    clean = re.sub(r"\\frac\{(.+?)\}\{(.+?)\}", r"(\1)&frasl;(\2)", clean)
+
+    # 5. Formatting
+    clean = re.sub(r"\\textbf\{(.+?)\}", r"<b>\1</b>", clean)
+    clean = re.sub(r"\\textit\{(.+?)\}", r"<i>\1</i>", clean)
+    
+    # 6. Cleanup
+    clean = clean.replace("$", "").replace("\\", "")
+
+    return clean
+
+# Helper 7: Call CF vision model to extract math problems from PDF as LaTeX
+async def extract_problems_from_image(image_bytes):
+    """
+    Sends an image to Llama 3.2 Vision using the standard OpenAI 'image_url' format.
+    """
+    model = "@cf/meta/llama-3.2-11b-vision-instruct"
+
+    # 1. Encode image to Base64
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    
+    # 2. Create the Data URL (Crucial for this API)
+    data_url = f"data:image/jpeg;base64,{base64_image}"
+
+    prompt = """
+    Analyze this homework page. Extract every math problem you see into a strictly formatted list.
+    Rules:
+    1) Output only the problem, separated by the delimiter "---Problem---".
+    2) Use standard LaTeX formatting for all math equations (e.g. use $...$ or $$...$$).
+    3) Do not solve the problems. Just transcribe them.
+    4) Ignore headers, footers, or page numbers.
+    """
+
+    # 3. Construct Payload (OpenAI Format)
+    payload = {
+        "messages": [
+            {
+                "role": "user", 
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url", 
+                        "image_url": {
+                            "url": data_url
+                        }
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 2048
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{AI_base_url}/{model}", 
+                headers=HEADERS,
+                json=payload,
+                timeout=60.0 
+            )
+            
+            # Debugging logs
+            if response.status_code != 200:
+                print(f"❌ Vision API Error {response.status_code}: {response.text}")
+                return []
+            
+            result = response.json()
+            
+            if "result" in result:
+                inner = result["result"]
+                # Robust Key Checking
+                if isinstance(inner, dict):
+                    raw_text = inner.get("response") or inner.get("description") or inner.get("text")
+                else:
+                    raw_text = str(inner)
+
+                if raw_text:
+                    problems = raw_text.split("---Problem---")
+                    return [p.strip() for p in problems if p.strip()]
+            
+            return []
+
+        except Exception as e:
+            print(f"❌ Vision Exception: {e}")
+            return []
+
+# Helper 8: json sanitization
+def sanitize_json_output(text: str) -> str:
+    """
+    Fixes common JSON errors from LLMs, specifically unescaped backslashes in LaTeX.
+    Example: Converts "\frac" to "\\frac" so json.loads() doesn't crash.
+    """
+    # 1. Remove markdown code blocks if present
+    text = text.replace("```json", "").replace("```", "").strip()
+    
+    # 2. Fix invalid escape sequences (The Magic Regex)
+    # This looks for a backslash that is NOT followed by a valid JSON escape char (" \ / b f n r t u)
+    # and doubles it.
+    # Pattern: \ (negative lookahead for valid chars)
+    text = re.sub(r'\\(?![/u"bfnrt\\])', r'\\\\', text)
+    
+    return text
 
 # --- ENDPOINTS ---
 @app.get("/") # for base path
@@ -582,4 +740,311 @@ async def generate_pdf(data: dict, disposition: str = "attachment"): # <--- Add 
         media_type="application/pdf",
         # --- CHANGE HERE: Use variable disposition ---
         headers={"Content-Disposition": f"{disposition}; filename={filename}_notes.pdf"}
+    )
+
+@app.post("/process-homework")
+async def process_homework(file: UploadFile = File(...)):
+    print(f"Processing Homework: {file.filename}...")
+    
+    # get bytes from pdf
+    pdf_bytes = await file.read()
+
+    # Save homework to DB (Get the new ID)
+    async with httpx.AsyncClient() as client:
+        # Insert into 'homeworks' table
+        await client.post(
+            D1_BASE, 
+            headers=HEADERS, 
+            json={
+                "sql": "INSERT INTO homeworks (filename) VALUES (?)",
+                "params": [file.filename]
+            }
+        )
+        # Fetch the ID (This is the standard reliable way with D1)
+        id_resp = await client.post(
+            D1_BASE, headers=HEADERS, json={"sql": "SELECT last_insert_rowid() as id", "params": []}
+        )
+        # Handle cases where D1 returns the result differently
+        try:
+            homework_id = id_resp.json()["result"][0]["results"][0]["id"]
+        except (KeyError, IndexError):
+             # Fallback if structure varies
+            print("Error fetching ID, defaulting to 0")
+            homework_id = 0
+
+    extracted_problems = []
+
+    # Convert PDF to Images using PyMuPDF 
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        print(f"Error opening PDF: {e}")
+        return {"status": "error", "message": "Invalid PDF file"}
+
+    for page_num, page in enumerate(doc):
+        print(f"   --> Scanning Page {page_num + 1}...")
+        
+        # Render page to an image (Pixmap)
+        pix = page.get_pixmap(dpi=75) # 75 DPI is good balance for Vision AI
+        
+        # Convert to bytes (JPEG format)
+        img_bytes = pix.tobytes("jpeg")
+
+        # 4. Send to Vision AI
+        page_problems = await extract_problems_from_image(img_bytes)
+        
+        # 5. Link & Save each problem
+        for prob_text in page_problems:
+            # A. Generate Embedding
+            prob_vector = await generate_embeddings([prob_text])
+            
+            if not prob_vector: continue
+
+            # B. Search Vector DB for link
+            search_url = VECTOR_base_url.replace("/insert", "/query")
+            search_payload = {
+                "vector": prob_vector[0],
+                "topK": 1, 
+                "returnMetadata": "all"
+            }
+            
+            lecture_link = {"filename": None, "timestamp": None, "summary": None}
+            
+            async with httpx.AsyncClient() as search_client:
+                s_res = await search_client.post(search_url, headers=HEADERS, json=search_payload)
+                s_data = s_res.json()
+                if s_data.get("result") and s_data["result"].get("matches"):
+                    match = s_data["result"]["matches"][0]
+                    lecture_link["filename"] = match["metadata"].get("filename")
+                    lecture_link["timestamp"] = match["metadata"].get("start_time_sec")
+                    lecture_link["summary"] = match["metadata"].get("text_preview")[:200]
+
+            # C. Save to D1
+            sql = """
+            INSERT INTO problems (homework_id, problem_text, related_lecture_filename, related_lecture_timestamp, related_concept_summary)
+            VALUES (?, ?, ?, ?, ?)
+            """
+            params = [
+                homework_id, 
+                prob_text, 
+                lecture_link["filename"], 
+                lecture_link["timestamp"], 
+                lecture_link["summary"]
+            ]
+            
+            async with httpx.AsyncClient() as db_client:
+                await db_client.post(D1_BASE, headers=HEADERS, json={"sql": sql, "params": params})
+            
+            extracted_problems.append({
+                "problem": prob_text[:50] + "...",
+                "linked_lecture": lecture_link["filename"],
+                "linked_lecture_timestamp": lecture_link["timestamp"]
+            })
+
+    return {
+        "status": "success", 
+        "homework_id": homework_id,
+        "problems_extracted": len(extracted_problems),
+        "details": extracted_problems
+    }
+
+# --- ENDPOINT: Generate Practice Exam (AI) ---
+@app.post("/generate-practice-exam")
+async def generate_practice_exam(request: ExamRequest):
+    print(f"Generating exam for Homework ID: {request.homework_id}...")
+
+    # 1. Fetch original problems from D1
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            D1_BASE,
+            headers=HEADERS,
+            json={
+                "sql": "SELECT problem_text, related_concept_summary FROM problems WHERE homework_id = ?",
+                "params": [request.homework_id]
+            }
+        )
+        data = response.json()
+        
+        if not data.get("success") or not data["result"][0]["results"]:
+            raise HTTPException(status_code=404, detail="No problems found for this homework ID")
+            
+        original_problems = data["result"][0]["results"]
+
+    # 2. Build Prompt (Using Custom Blocks, NOT JSON)
+    problems_text = "\n".join([f"Problem {i+1}: {p['problem_text']} (Context: {p['related_concept_summary']})" for i, p in enumerate(original_problems)])
+
+    prompt = f"""
+    You are a strict University Math Professor. 
+    Create a 'Practice Exam' based on the following homework problems.
+    
+    For EACH original problem, generate a NEW problem that tests the exact same concept but changes the numbers or context.
+    
+    OUTPUT FORMAT:
+    Do not use JSON. Use exactly this format for every problem:
+    
+    ---START---
+    QUESTION:
+    (Write the question here using LaTeX)
+    
+    SOLUTION:
+    (Write the final answer here using LaTeX)
+    
+    EXPLANATION:
+    (Write the step-by-step guide here)
+    ---END---
+
+    ORIGINAL PROBLEMS:
+    {problems_text}
+    """
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are a helpful AI that follows custom formatting rules strictly."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 3000
+    }
+
+    # 3. Call Llama 3.1 70B
+    print("Sending to Llama 70B...")
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"{AI_base_url}/@cf/meta/llama-3.1-70b-instruct",
+                headers=HEADERS,
+                json=payload,
+                timeout=120.0
+            )
+            result = response.json()
+            
+            if "result" not in result or "response" not in result["result"]:
+                 raise ValueError("Invalid response from AI model")
+
+            raw_text = result["result"]["response"]
+            
+            # 4. Parse the Custom Blocks
+            # This logic is 100x more robust than json.loads() for math
+            exam_data = []
+            
+            # Split by the "---START---" delimiter
+            blocks = raw_text.split("---START---")
+            
+            for block in blocks:
+                if "---END---" not in block:
+                    continue # Skip empty or malformed blocks
+                
+                # Extract the content before ---END---
+                content = block.split("---END---")[0]
+                
+                # Parse fields using simple string searching
+                # We use "split" with maxsplit=1 to find the headers safely
+                try:
+                    # Default values
+                    q, s, e = "", "", ""
+                    
+                    # Regex is safer for flexible whitespace
+                    import re
+                    
+                    # Find Question
+                    q_match = re.search(r"QUESTION:\s*(.*?)\s*(?=SOLUTION:)", content, re.DOTALL)
+                    if q_match: q = q_match.group(1).strip()
+                    
+                    # Find Solution
+                    s_match = re.search(r"SOLUTION:\s*(.*?)\s*(?=EXPLANATION:)", content, re.DOTALL)
+                    if s_match: s = s_match.group(1).strip()
+                    
+                    # Find Explanation (runs until end of block)
+                    e_match = re.search(r"EXPLANATION:\s*(.*)", content, re.DOTALL)
+                    if e_match: e = e_match.group(1).strip()
+                    
+                    if q and s:
+                        exam_data.append({
+                            "question": q,
+                            "solution": s,
+                            "explanation": e
+                        })
+                except Exception as parse_err:
+                    print(f"Skipping malformed block: {parse_err}")
+                    continue
+
+            return exam_data
+
+        except Exception as e:
+            print(f"Exam Gen Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+# --- ENDPOINT: Download Exam PDF ---
+class PDFRequest(BaseModel):
+    title: str
+    problems: List[ExamProblem]
+    include_solutions: bool
+
+@app.post("/download-exam-pdf")
+async def download_exam_pdf(data: PDFRequest):
+    pdf = PDF() 
+    pdf.add_page()
+    
+    # Header
+    pdf.set_font("Times", "B", 20)
+    pdf.cell(0, 10, f"Practice Exam: {data.title}", ln=True, align='C')
+    
+    if data.include_solutions:
+        pdf.set_text_color(200, 0, 0)
+        pdf.set_font("Times", "I", 14)
+        pdf.cell(0, 10, "INSTRUCTOR SOLUTION KEY", ln=True, align='C')
+    else:
+        pdf.set_font("Times", "I", 12)
+        pdf.cell(0, 10, "Student Version - Time Limit: 60 mins", ln=True, align='C')
+    
+    pdf.ln(10)
+    pdf.set_text_color(0, 0, 0)
+
+    # Content
+    for i, p in enumerate(data.problems):
+        # --- QUESTION SECTION ---
+        pdf.set_font("Times", "B", 14)
+        pdf.cell(0, 10, f"Question {i+1}", ln=True)
+        
+        # Use HTML for the question text to render math
+        pdf.set_font("Times", "", 12)
+        q_html = f"<p>{clean_for_pdf(p.question)}</p>"
+        pdf.write_html(q_html) 
+        pdf.ln(5)
+
+        # --- SOLUTION SECTION ---
+        if data.include_solutions:
+            # Draw a light gray box for the solution
+            # Save Y position
+            start_y = pdf.get_y()
+            
+            pdf.set_fill_color(245, 245, 245)
+            # We assume a fixed height box for simplicity, or just fill background rect
+            pdf.set_font("Times", "B", 12)
+            pdf.set_text_color(0, 100, 0) 
+            pdf.cell(0, 8, "Solution:", ln=True)
+            
+            pdf.set_font("Times", "", 12)
+            pdf.set_text_color(0, 0, 0)
+            
+            # Write HTML Solution
+            sol_html = f"<p><b>Answer:</b> {clean_for_pdf(p.solution)}<br><br><i>Explanation:</i> {clean_for_pdf(p.explanation)}</p>"
+            pdf.write_html(sol_html)
+            
+            pdf.ln(10)
+        else:
+            # Blank space for students
+            pdf.ln(40)
+            pdf.set_draw_color(200, 200, 200)
+            pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+            pdf.set_draw_color(0, 0, 0)
+            pdf.ln(10)
+
+    pdf_bytes = pdf.output(dest='S')
+    
+    filename = f"Practice_Exam_{'KEY' if data.include_solutions else 'Student'}.pdf"
+    
+    return Response(
+        content=bytes(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
